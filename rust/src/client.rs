@@ -410,6 +410,11 @@ const STREAM_CHUNK_BUDGET: usize = 256 * 1024;
 // matches the read-ahead buffer so "fits in the buffer" and "worth draining" agree.
 const ABANDON_DRAIN_LIMIT: u64 = STREAM_BUFFER_BYTES as u64;
 
+// The drain also gives up after this long, so a server or proxy that goes quiet mid-body
+// cannot hold the connection open. Chromium's HttpResponseBodyDrainer uses the same
+// 5 s (kTimeoutInSeconds) for the same job.
+const ABANDON_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 struct BodyStreamState {
     frames: mpsc::UnboundedReceiver<wreq::Result<Bytes>>,
     /// Bytes the pump may still buffer. The pump takes permits per frame, the reader
@@ -564,15 +569,15 @@ pub fn store_body_stream(mut stream: ResponseBodyStream, content_length: Option<
     HTTP_RUNTIME.spawn(async move {
         let mut delivered: u64 = 0;
         let mut drained: u64 = 0;
-        let mut draining = false;
+        let mut drain_deadline: Option<tokio::time::Instant> = None;
 
         loop {
-            if draining {
-                // Nobody will read this body. Discard the remainder up to the cap so
-                // the connection can be reused; past it, drop the stream and let hyper
-                // close the connection.
-                match stream.next().await {
-                    Some(Ok(bytes)) => {
+            if let Some(deadline) = drain_deadline {
+                // Nobody will read this body. Discard the remainder up to the cap and the
+                // deadline so the connection can be reused; past either, drop the stream
+                // and let hyper close the connection.
+                match tokio::time::timeout_at(deadline, stream.next()).await {
+                    Ok(Some(Ok(bytes))) => {
                         drained += bytes.len() as u64;
                         if drained > ABANDON_DRAIN_LIMIT {
                             break;
@@ -587,7 +592,7 @@ pub fn store_body_stream(mut stream: ResponseBodyStream, content_length: Option<
                 // The reader side is gone (cancelled from JS, or the entry was evicted).
                 _ = pump_abandon.cancelled() => {
                     if abandoned_body_is_drainable(content_length, delivered) {
-                        draining = true;
+                        drain_deadline = Some(tokio::time::Instant::now() + ABANDON_DRAIN_TIMEOUT);
                         continue;
                     }
                     break;
@@ -610,7 +615,7 @@ pub fn store_body_stream(mut stream: ResponseBodyStream, content_length: Option<
                         // Abandoned while waiting for buffer room; this frame counts as drained.
                         if abandoned_body_is_drainable(content_length, delivered) {
                             drained += bytes.len() as u64;
-                            draining = true;
+                            drain_deadline = Some(tokio::time::Instant::now() + ABANDON_DRAIN_TIMEOUT);
                             continue;
                         }
                         break;
@@ -656,6 +661,17 @@ fn finish_body_stream_end(handle: u64) {
     }
 }
 
+/// The next buffered frame, or `None` once the body has ended or been cancelled. A read
+/// that is already waiting when cancelBody() runs returns at once instead of waiting for
+/// the pump, which may still be draining the connection.
+async fn next_frame(body: &StoredBody, state: &mut BodyStreamState) -> Option<wreq::Result<Bytes>> {
+    tokio::select! {
+        biased;
+        _ = body.abandon.cancelled() => None,
+        frame = state.frames.recv() => frame,
+    }
+}
+
 pub async fn read_body_chunk(handle: u64) -> Result<Option<Bytes>> {
     let stream = BODY_STREAMS
         .get(&handle)
@@ -668,7 +684,7 @@ pub async fn read_body_chunk(handle: u64) -> Result<Option<Bytes>> {
     }
 
     // Wait for one frame; this is the only point that blocks on the network.
-    let first = match guard.frames.recv().await {
+    let first = match next_frame(&stream, &mut guard).await {
         Some(Ok(bytes)) => bytes,
         Some(Err(err)) => return Err(finish_body_stream_error(handle, err)),
         None => {
@@ -706,8 +722,9 @@ pub async fn read_body_chunk(handle: u64) -> Result<Option<Bytes>> {
 
 /// Read entire body into a single buffer. More efficient than streaming for small bodies.
 pub async fn read_body_all(handle: u64) -> Result<Bytes> {
+    // Left in the map until the body ends so cancelBody() can still reach it.
     let stream = BODY_STREAMS
-        .remove(&handle)
+        .get(&handle)
         .ok_or_else(|| anyhow!("Body handle {} not found", handle))?;
 
     let mut guard = stream.state.lock().await;
@@ -718,7 +735,7 @@ pub async fn read_body_all(handle: u64) -> Result<Bytes> {
         return Err(finish_body_stream_error(handle, err));
     }
 
-    while let Some(result) = guard.frames.recv().await {
+    while let Some(result) = next_frame(&stream, &mut guard).await {
         let bytes = match result {
             Ok(bytes) => bytes,
             Err(err) => return Err(finish_body_stream_error(handle, err)),
@@ -731,6 +748,7 @@ pub async fn read_body_all(handle: u64) -> Result<Bytes> {
         chunks.push(bytes);
     }
 
+    BODY_STREAMS.remove(&handle);
     if let Some((_, state)) = BODY_EVENT_STATES.remove(&handle) {
         emit_body_complete(&state);
     }
