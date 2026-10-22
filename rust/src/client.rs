@@ -145,6 +145,7 @@ pub struct RequestOptions {
     pub read_timeout: Option<u64>,
     pub compress: bool,
     pub capture_diagnostics: bool,
+    pub resolve: Vec<(String, Vec<SocketAddr>)>,
     pub event_sink: Option<RequestEventSink>,
 }
 
@@ -171,6 +172,7 @@ struct SessionConfig {
     connect_timeout: Option<Duration>,
     read_timeout: Option<Duration>,
     capture_diagnostics: bool,
+    resolve: Vec<(String, Vec<SocketAddr>)>,
 }
 
 impl SessionConfig {
@@ -186,6 +188,7 @@ impl SessionConfig {
             connect_timeout: options.connect_timeout.map(Duration::from_millis),
             read_timeout: options.read_timeout.map(Duration::from_millis),
             capture_diagnostics: options.capture_diagnostics,
+            resolve: options.resolve.clone(),
         }
     }
 }
@@ -223,7 +226,7 @@ impl TransportConfig {
             connect_timeout: options.connect_timeout.map(Duration::from_millis),
             read_timeout: options.read_timeout.map(Duration::from_millis),
             capture_diagnostics: options.capture_diagnostics,
-            resolve: Vec::new(),
+            resolve: options.resolve.clone(),
         }
     }
 
@@ -926,6 +929,10 @@ fn build_ephemeral_client(config: &SessionConfig) -> Result<ResolvedClient> {
 
     if config.capture_diagnostics {
         client_builder = client_builder.tls_info(true);
+    }
+
+    for (domain, addrs) in &config.resolve {
+        client_builder = client_builder.resolve_to_addrs(domain.clone(), addrs.iter().copied());
     }
 
     let http_client = client_builder

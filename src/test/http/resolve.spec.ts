@@ -1,6 +1,6 @@
 import assert from "node:assert";
 import { describe, test } from "node:test";
-import { createTransport, fetch as wreqFetch } from "../../wreq-js.js";
+import { createSession, createTransport, RequestError, fetch as wreqFetch } from "../../wreq-js.js";
 
 const SELF_SIGNED_URL = process.env.HTTPS_SELF_SIGNED_URL;
 const CUSTOM_CA_URL = process.env.HTTPS_CUSTOM_CA_URL;
@@ -148,6 +148,54 @@ describe("DNS resolve override", () => {
         resolve: { [PINNED_HOST]: [123 as unknown as string] },
       }),
       "createTransport should reject a non-string address",
+    );
+  });
+
+  test("pins a host for a single request without a transport", async () => {
+    const response = await wreqFetch(PINNED_URL, {
+      browser: "chrome_142",
+      insecure: true,
+      resolve: { [PINNED_HOST]: "127.0.0.1" },
+      timeout: 10_000,
+    });
+
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as { message?: string };
+    assert.equal(body.message, "local test server");
+  });
+
+  test("a pinned request does not lend its address to the next request", async () => {
+    const options = { browser: "chrome_142", insecure: true, timeout: 10_000 } as const;
+    const pinned = await wreqFetch(PINNED_URL, { ...options, resolve: { [PINNED_HOST]: "127.0.0.1" } });
+    assert.equal(pinned.status, 200);
+    await pinned.text();
+
+    await assert.rejects(wreqFetch(PINNED_URL, options), "the unpinned request should not reach the host");
+  });
+
+  test("rejects a per-request resolve combined with a transport", async () => {
+    const transport = await createTransport({ browser: "chrome_142", insecure: true });
+
+    try {
+      await assert.rejects(wreqFetch(PINNED_URL, { transport, resolve: { [PINNED_HOST]: "127.0.0.1" } }), RequestError);
+    } finally {
+      await transport.close();
+    }
+  });
+
+  test("rejects a per-request resolve on a session", async () => {
+    const session = await createSession({ browser: "chrome_142", insecure: true });
+
+    try {
+      await assert.rejects(session.fetch(PINNED_URL, { resolve: { [PINNED_HOST]: "127.0.0.1" } }), RequestError);
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("rejects a malformed per-request resolve address", async () => {
+    await assert.rejects(
+      wreqFetch(PINNED_URL, { browser: "chrome_142", resolve: { [PINNED_HOST]: "not-an-ip-address" } }),
     );
   });
 });

@@ -425,6 +425,14 @@ export interface RequestInit {
   proxy?: string;
 
   /**
+   * Override DNS resolution for this request only. See {@link ResolveMap}.
+   * Useful for pinning a host to an address you have already resolved and vetted,
+   * without creating and closing a transport for the request.
+   * Not allowed with `transport` (set `resolve` on the transport instead) or on a session.
+   */
+  resolve?: ResolveMap;
+
+  /**
    * Request timeout in milliseconds. If the request takes longer than this value,
    * it will be aborted.
    * @default 30000
