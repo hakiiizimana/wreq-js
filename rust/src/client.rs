@@ -1098,6 +1098,7 @@ mod tests {
             read_timeout: None,
             compress: true,
             capture_diagnostics: false,
+            resolve: Vec::new(),
             event_sink: None,
         }
     }
