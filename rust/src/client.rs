@@ -597,19 +597,30 @@ impl EphemeralClientManager {
     }
 }
 
-pub async fn make_request(options: RequestOptions) -> Result<Response> {
-    let transport_id = options.transport_id.clone();
+/// Resolve client: explicit transport > ephemeral cache > fresh client.
+fn client_for_request(options: &RequestOptions) -> Result<Arc<ResolvedClient>> {
+    if let Some(ref tid) = options.transport_id {
+        return TRANSPORT_MANAGER.get_transport(tid);
+    }
 
-    // Resolve client: explicit transport > ephemeral cache > fresh client
-    let resolved = if let Some(ref tid) = transport_id {
-        TRANSPORT_MANAGER.get_transport(tid)?
-    } else if options.ephemeral {
-        let config = SessionConfig::from_request(&options);
-        EPHEMERAL_MANAGER.client_for(config)?
-    } else {
-        let config = TransportConfig::from_request(&options);
-        Arc::new(build_client(&config)?)
-    };
+    if options.ephemeral {
+        let config = SessionConfig::from_request(options);
+        // A pinned request gets a client of its own, like a sessionId request does.
+        // Cached, every distinct pin would keep a client and its trust store alive for
+        // the cache's idle timeout, and pinning each request to a freshly vetted
+        // address is the main use of a per-request resolve.
+        if !config.resolve.is_empty() {
+            return Ok(Arc::new(build_ephemeral_client(&config)?));
+        }
+        return EPHEMERAL_MANAGER.client_for(config);
+    }
+
+    let config = TransportConfig::from_request(options);
+    Ok(Arc::new(build_client(&config)?))
+}
+
+pub async fn make_request(options: RequestOptions) -> Result<Response> {
+    let resolved = client_for_request(&options)?;
 
     // Resolve cookie jar: ephemeral gets a fresh jar, sessions share one
     let cookie_jar = if options.ephemeral {
@@ -1120,6 +1131,25 @@ mod tests {
         assert_ne!(base_config, connect_config);
         assert_ne!(base_config, read_config);
         assert_ne!(connect_config, read_config);
+    }
+
+    #[test]
+    fn pinned_ephemeral_requests_are_not_cached() {
+        let mut pinned = base_request_options();
+        pinned.resolve = vec![(
+            "pinned.invalid".to_string(),
+            vec!["127.0.0.1:0".parse().unwrap()],
+        )];
+        client_for_request(&pinned).expect("pinned client");
+        assert!(!EPHEMERAL_MANAGER
+            .cache
+            .contains_key(&SessionConfig::from_request(&pinned)));
+
+        let unpinned = base_request_options();
+        client_for_request(&unpinned).expect("unpinned client");
+        assert!(EPHEMERAL_MANAGER
+            .cache
+            .contains_key(&SessionConfig::from_request(&unpinned)));
     }
 
     #[test]
