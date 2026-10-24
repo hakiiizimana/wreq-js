@@ -198,7 +198,28 @@ describe("DNS resolve override", () => {
   test("rejects a malformed per-request resolve address", async () => {
     await assert.rejects(
       wreqFetch(PINNED_URL, { browser: "chrome_142", resolve: { [PINNED_HOST]: "not-an-ip-address" } }),
+      (error: unknown) => error instanceof RequestError && /Invalid resolve address/.test(error.message),
     );
+  });
+
+  test("pins requests that share cookies through a sessionId", async () => {
+    const base = `https://${PINNED_HOST}:${PORT}`;
+    const options = {
+      browser: "chrome_142",
+      insecure: true,
+      sessionId: `resolve-${Date.now()}`,
+      cookieMode: "session",
+      resolve: { [PINNED_HOST]: "127.0.0.1" },
+      timeout: 10_000,
+    } as const;
+
+    const set = await wreqFetch(`${base}/cookies/set?pinned=yes`, options);
+    assert.equal(set.status, 200);
+    await set.text();
+
+    const echoed = await wreqFetch(`${base}/cookies`, options);
+    const body = (await echoed.json()) as { cookies?: Record<string, string> };
+    assert.equal(body.cookies?.pinned, "yes");
   });
 
   test("a redirect to another host is not pinned, and redirect: manual stops before it", async () => {
