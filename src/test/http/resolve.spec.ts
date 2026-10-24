@@ -1,4 +1,6 @@
 import assert from "node:assert";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { describe, test } from "node:test";
 import { createSession, createTransport, RequestError, fetch as wreqFetch } from "../../wreq-js.js";
 
@@ -197,5 +199,37 @@ describe("DNS resolve override", () => {
     await assert.rejects(
       wreqFetch(PINNED_URL, { browser: "chrome_142", resolve: { [PINNED_HOST]: "not-an-ip-address" } }),
     );
+  });
+
+  test("a redirect to another host is not pinned, and redirect: manual stops before it", async () => {
+    let redirected = 0;
+    const landed: string[] = [];
+    const server = createServer((req, res) => {
+      if (req.url === "/landed") {
+        landed.push(req.headers.host ?? "");
+        res.end("landed");
+        return;
+      }
+      redirected += 1;
+      res.writeHead(302, { Location: `http://unpinned-target.invalid:${port}/landed` });
+      res.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as AddressInfo;
+    const url = `http://${PINNED_HOST}:${port}/`;
+    const resolve = { [PINNED_HOST]: "127.0.0.1" };
+
+    try {
+      // Followed, the redirect target goes through normal DNS, which cannot resolve it.
+      await assert.rejects(wreqFetch(url, { resolve, timeout: 10_000 }), RequestError);
+      assert.equal(redirected, 1, "the pinned first hop should have reached the server");
+
+      const response = await wreqFetch(url, { resolve, redirect: "manual", timeout: 10_000 });
+      assert.equal(response.status, 302);
+      assert.equal(response.headers.get("location"), `http://unpinned-target.invalid:${port}/landed`);
+      assert.deepEqual(landed, [], "the redirect target must not have been requested");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 });
